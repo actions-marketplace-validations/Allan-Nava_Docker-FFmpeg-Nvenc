@@ -3,6 +3,12 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [2.4.0] - 2026-09-21
+
+### Added
+
+- `logs`: add build logs for various build failures and shutdowns
+
 ## [2.3.0] - 2026-09-17
 
 ### Added
