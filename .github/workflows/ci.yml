@@ -1,8 +1,8 @@
 name: CI
 
-# Gira su ogni push/PR e una volta a settimana: lo schedule serve a intercettare
-# il marcire delle base image (e' esattamente cosi' che il repo si e' rotto in
-# silenzio quando Debian buster e' finito su archive.debian.org).
+# Runs on every push/PR and once a week: the schedule is there to catch base images rotting away
+# (that is exactly how this repository broke in silence when Debian buster moved to
+# archive.debian.org).
 on:
   push:
     branches: [main]
@@ -38,10 +38,84 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck tests/*.sh
 
-      - name: actionlint (workflow)
+      - name: actionlint (workflows)
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
+
+  tests:
+    name: Tests (tooling and page generator)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Stdlib only, no setup-python: these run in seconds and gate the generated artefacts below.
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Backlog lint
+        run: python3 docs/scripts/backlog-lint.py
+
+      - name: Generated pages are up to date
+        run: |
+          python3 docs/scripts/generate-roadmap.py --check
+          python3 site/build.py --check
+
+  commit-lint:
+    name: Commit subjects and CHANGELOG
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The release bump is derived from these subjects, so an unparseable one is a release that
+      # cannot be numbered. Same rule as the local commit-msg hook: docs/scripts/lib/changelog.py.
+      - name: Conventional commits
+        run: |
+          python3 - <<'PY'
+          import subprocess, sys, os
+          sys.path.insert(0, "docs/scripts/lib")
+          import changelog as C
+          base = os.environ["BASE_SHA"]
+          log = subprocess.run(["git", "log", "--format=%B%x00", f"{base}..HEAD"],
+                               check=True, text=True, capture_output=True).stdout
+          bad = [m.strip().split("\n")[0] for m in log.split("\0")
+                 if m.strip() and not C.is_acceptable(m.strip())]
+          for subject in bad:
+              print(f"::error::not a conventional commit: {subject}")
+          sys.exit(1 if bad else 0)
+          PY
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
+      # A change to the image or the tooling that nobody can find in the CHANGELOG is a change that
+      # is discovered by whoever it breaks. Docs-only and log-only PRs are exempt.
+      - name: CHANGELOG entry present
+        run: |
+          python3 - <<'PY'
+          import subprocess, sys, os
+          sys.path.insert(0, "docs/scripts/lib")
+          import changelog as C
+          base = os.environ["BASE_SHA"]
+          files = subprocess.run(["git", "diff", "--name-only", f"{base}..HEAD"],
+                                 check=True, text=True, capture_output=True).stdout.split()
+          exempt = lambda f: f.startswith(("docs/", "logs/", "site/dist/")) or f.endswith(".md")
+          code = [f for f in files if not exempt(f)]
+          with open("CHANGELOG.md", encoding="utf-8") as fh:
+              has = C.has_unreleased_entries(fh.read())
+          if code and not has:
+              print("::error::this PR touches " + ", ".join(code[:5]) +
+                    " but [Unreleased] in CHANGELOG.md is empty "
+                    "(use: python3 docs/scripts/changelog-add.py --message '<commit subject>')")
+              sys.exit(1)
+          print("ok: " + ("entries present" if has else "docs-only change"))
+          PY
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
 
   build-test:
     name: Build & test (ffmpeg ${{ matrix.ffmpeg }})
@@ -51,11 +125,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ffmpeg: '7.1.1'
+          - ffmpeg: '9.0.1'
             nvcodec: 'sdk/12.1'
-          - ffmpeg: '6.0'
-            nvcodec: 'sdk/12.0'
-          - ffmpeg: '5.1.2'
+          - ffmpeg: '7.1.5'
+            nvcodec: 'sdk/12.1'
+          - ffmpeg: '6.1.6'
+            nvcodec: 'sdk/12.1'
+          - ffmpeg: '5.1.10'
             nvcodec: 'sdk/11.0'
     steps:
       - name: Checkout
@@ -81,17 +157,17 @@ jobs:
       - name: Smoke test
         run: ./tests/smoke.sh ffmpeg-nvenc:ci-${{ matrix.ffmpeg }} ${{ matrix.ffmpeg }}
 
-      - name: Dimensione immagine
+      - name: Image size
         run: |
           SIZE=$(docker image inspect ffmpeg-nvenc:ci-${{ matrix.ffmpeg }} --format '{{.Size}}')
           echo "### FFmpeg ${{ matrix.ffmpeg }} — $((SIZE / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"
-          # niente `ffmpeg | head`: head chiude la pipe, ffmpeg prende SIGPIPE e
-          # il default `-o pipefail` di Actions fa fallire lo step con 141.
+          # No `ffmpeg | head`: head closes the pipe, ffmpeg takes SIGPIPE and Actions' default
+          # `-o pipefail` fails the step with 141.
           docker run --rm ffmpeg-nvenc:ci-${{ matrix.ffmpeg }} -hide_banner -version > version.txt
           head -n 1 version.txt >> "$GITHUB_STEP_SUMMARY"
 
   scan:
-    name: Scan vulnerabilita
+    name: Vulnerability scan
     runs-on: ubuntu-latest
     needs: build-test
     permissions:
@@ -104,7 +180,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build immagine di default
+      - name: Build the default image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -112,7 +188,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ffmpeg-nvenc:scan
-          cache-from: type=gha,scope=ffmpeg-7.1.1
+          cache-from: type=gha,scope=ffmpeg-9.0.1
 
       - name: Trivy
         uses: aquasecurity/trivy-action@v0.36.0
@@ -123,7 +199,7 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-      - name: Carica risultati su code scanning
+      - name: Upload results to code scanning
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy.sarif

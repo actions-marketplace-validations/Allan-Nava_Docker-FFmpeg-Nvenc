@@ -1,27 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# Sorgente unica di verita per tutte le varianti dell'immagine.
-# La matrice (FFmpeg 5.1.2 / 6.0 / 7.1.1) vive nei workflow, non in Dockerfile duplicati.
+# Single source of truth for every variant of the image.
+# The matrix (FFmpeg 5.1.10 / 6.1.6 / 7.1.5 / 9.0.1) lives in the workflows, not in duplicated
+# Dockerfiles.
 #
-#   docker build --build-arg FFMPEG_VERSION=6.0 --build-arg NVCODEC_BRANCH=sdk/12.0 -t ffmpeg-nvenc:6.0 .
+#   docker build --build-arg FFMPEG_VERSION=6.1.6 --build-arg NVCODEC_BRANCH=sdk/12.1 -t ffmpeg-nvenc:6.1.6 .
 #
-# NB: i nomi versionati dei pacchetti runtime (libx264-164, libx265-199, libvpx7) sono
-# specifici di Debian 12 (bookworm). Cambiando DEBIAN_VERSION vanno riallineati.
+# Note: the versioned runtime package names (libx264-164, libx265-199, libvpx7) are specific to
+# Debian 12 (bookworm). Changing DEBIAN_VERSION means realigning them.
 
 ARG DEBIAN_VERSION=12
 
 ##############################################################################
-# Stage 1 — builder: toolchain, headers NVENC e compilazione di FFmpeg
+# Stage 1 — builder: toolchain, NVENC headers, and the FFmpeg build
 ##############################################################################
 FROM debian:${DEBIAN_VERSION}-slim AS builder
 
-ARG FFMPEG_VERSION=7.1.1
+ARG FFMPEG_VERSION=9.0.1
 
-# Deve soddisfare il check pkg-config `ffnvcodec` del configure di FFmpeg:
-#   FFmpeg 5.1.x -> ffnvcodec >= 9.1.23.1   (sdk/11.0 = 11.0.10.4.1)
-#   FFmpeg 6.0   -> ffnvcodec >= 12.0.16.0  (sdk/12.0 = 12.0.16.3.0)
-#   FFmpeg 7.1.x -> ffnvcodec >= 12.1.14.0  (sdk/12.1 = 12.1.14.2.0)
-# Branch piu alto = driver NVIDIA minimo piu alto: non alzarlo senza motivo.
+# Must satisfy the `ffnvcodec` pkg-config check in FFmpeg's configure:
+#   FFmpeg 5.1.x       -> ffnvcodec >= 9.1.23.1   (sdk/11.0)
+#   FFmpeg 6.0.x       -> ffnvcodec >= 12.0.16.0  (sdk/12.0)
+#   FFmpeg 6.1.x - 9.0 -> ffnvcodec >= 12.1.14.0  (sdk/12.1)
+# Measured on the configure of every maintained release (2026-09-17): the constraint does not move
+# inside a branch, and from 6.1 onwards it is the same up to 9.0.1 — so a newer FFmpeg does NOT
+# raise the host's minimum driver. Always pick the LOWEST branch that satisfies configure: a higher
+# one only raises that floor (sdk/12.2, sdk/13.0 exist and are deliberately unused).
 ARG NVCODEC_BRANCH=sdk/12.1
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -58,7 +62,7 @@ RUN apt-get update \
       zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Header NVENC/NVDEC. Non serve il CUDA toolkit: NVENC richiede solo ffnvcodec.
+# NVENC/NVDEC headers. The CUDA toolkit is not needed: NVENC only requires ffnvcodec.
 RUN git clone --branch "${NVCODEC_BRANCH}" --depth 1 \
       https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers \
  && make -C /tmp/nv-codec-headers install \
@@ -70,9 +74,9 @@ RUN curl -fsSL --retry 3 --retry-connrefused \
  && tar -xf /tmp/ffmpeg.tar.xz -C /usr/src/ffmpeg --strip-components=1 \
  && rm /tmp/ffmpeg.tar.xz
 
-# Niente --enable-nonfree: renderebbe il binario NON ridistribuibile, e nessuna
-# componente nonfree e abilitata. Niente -I/-L verso /usr/local/cuda: il toolkit
-# CUDA non e installato e NVENC non lo richiede.
+# No --enable-nonfree: it would make the binary NON-redistributable, and no nonfree component is
+# enabled anyway. No -I/-L pointing at /usr/local/cuda either: the CUDA toolkit is not installed
+# and NVENC does not need it.
 RUN ./configure \
       --prefix=/usr/local \
       --enable-gpl \
@@ -99,32 +103,32 @@ RUN ./configure \
  && make -j"$(nproc)" \
  && make install
 
-# Gate di build: se NVENC non e finito nel binario, l'immagine non deve esistere.
-# NB: niente `ffmpeg ... | grep -q` — grep esce al primo match, ffmpeg prende
-# SIGPIPE e con `pipefail` la pipeline fallisce con 141 anche quando il test passa.
+# Build gate: if NVENC did not make it into the binary, the image must not exist.
+# Note: no `ffmpeg ... | grep -q` — grep exits on the first match, ffmpeg takes SIGPIPE, and with
+# `pipefail` the pipeline fails with 141 even when the test passes.
 RUN /usr/local/bin/ffmpeg -hide_banner -encoders > /tmp/encoders.txt \
  && grep -q h264_nvenc /tmp/encoders.txt \
  && grep -q hevc_nvenc /tmp/encoders.txt \
  && rm /tmp/encoders.txt
 
 ##############################################################################
-# Stage 2 — runtime: solo binari e librerie condivise necessarie
+# Stage 2 — runtime: only the binaries and the shared libraries they need
 ##############################################################################
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG FFMPEG_VERSION=7.1.1
+ARG FFMPEG_VERSION=9.0.1
 ARG NVCODEC_BRANCH=sdk/12.1
 
 LABEL org.opencontainers.image.title="Docker-FFmpeg-Nvenc" \
-      org.opencontainers.image.description="FFmpeg ${FFMPEG_VERSION} con encoder NVIDIA NVENC (h264_nvenc, hevc_nvenc)" \
+      org.opencontainers.image.description="FFmpeg ${FFMPEG_VERSION} with NVIDIA NVENC encoders (h264_nvenc, hevc_nvenc)" \
       org.opencontainers.image.authors="Allan Nava" \
       org.opencontainers.image.source="https://github.com/Allan-Nava/Docker-FFmpeg-Nvenc" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
       media.hiway.ffmpeg.version="${FFMPEG_VERSION}" \
       media.hiway.nvcodec.branch="${NVCODEC_BRANCH}"
 
-# `all` esporrebbe capability non necessarie a una transcodifica.
+# `all` would expose capabilities a transcode does not need.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=video,compute,utility \
     LANG=C.UTF-8 \
@@ -160,7 +164,7 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=builder /usr/local/bin/ffprobe /usr/local/bin/ffprobe
 
-# Gate: il binario deve funzionare con le sole librerie dello stage runtime.
+# Gate: the binary must work with the runtime stage's libraries alone.
 RUN ffmpeg -hide_banner -version \
  && ffmpeg -hide_banner -encoders > /tmp/encoders.txt \
  && grep -q h264_nvenc /tmp/encoders.txt \

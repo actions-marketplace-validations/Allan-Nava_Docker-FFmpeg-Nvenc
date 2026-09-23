@@ -1,0 +1,3 @@
+time="2026-09-18T07:41:29+02:00" level=error msg="got 3 SIGTERM/SIGINTs, forcing shutdown"
+WARNING: buildx: failed to read current commit information with git rev-parse --is-inside-work-tree
+ERROR: listing workers for Build: failed to list workers: Canceled: context canceled

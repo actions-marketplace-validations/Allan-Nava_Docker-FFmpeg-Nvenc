@@ -1,15 +1,21 @@
 name: Publish
 
-# Un push di tag pubblica tutte le varianti su GHCR.
-# Ogni variante viene buildata, TESTATA e solo dopo pushata.
+# A tag push publishes every variant to GHCR. Each one is built, TESTED, and only then pushed.
 #
-# NB: niente `workflow_dispatch` — i tag sono generati da `type=semver`, che
-# produce risultati solo su eventi tag: un run manuale finirebbe con lista tag
-# vuota e push fallito. Per pubblicare si tagga.
+# The tag list is computed by docs/scripts/image-tags.py from the release and the variant, so a
+# manual run only needs the version input — there is no tag-event magic to work around.
+# Releases are created by `release.yml`, which tags without publishing — this workflow is the
+# explicit act of putting images on the registry.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag to publish, e.g. v2.0.0 (it must already exist)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,53 +33,62 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `default: true` pubblica ANCHE i tag senza suffisso (v1.2.3, v1.2, v1, latest).
-          - ffmpeg: '7.1.1'
+          # `default: true` also publishes the unsuffixed tags (v1.2.3, v1.2, v1, latest).
+          # Every row is the latest maintenance release of its branch, on the LOWEST sdk/* branch
+          # its configure accepts: from FFmpeg 6.1 onwards that is sdk/12.1 for all of them, so
+          # 9.0 costs no more driver than 7.1 does.
+          - ffmpeg: '9.0.1'
             nvcodec: 'sdk/12.1'
             default: true
-          - ffmpeg: '6.0'
-            nvcodec: 'sdk/12.0'
+          - ffmpeg: '7.1.5'
+            nvcodec: 'sdk/12.1'
             default: false
-          - ffmpeg: '5.1.2'
+          - ffmpeg: '6.1.6'
+            nvcodec: 'sdk/12.1'
+            default: false
+          - ffmpeg: '5.1.10'
             nvcodec: 'sdk/11.0'
             default: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Tag con suffisso di variante: v1.2.3-ffmpeg7.1.1, latest-ffmpeg7.1.1, ...
-      - name: Metadata (variante)
+      # Tags and labels come from docs/scripts/image-tags.py, which is unit-tested
+      # (tests/test_image_tags.py). They used to come from two docker/metadata-action steps whose
+      # semver pattern could not match once the variant suffix was appended — that is how `:latest`
+      # went unpublished for two years. Each variant gets one exact tag plus floating pointers at
+      # every level of its FFmpeg version; only the default row takes the unsuffixed tags.
+      - name: Tags and labels
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          flavor: |
-            latest=true
-            suffix=-ffmpeg${{ matrix.ffmpeg }},onlatest=true
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+        env:
+          RELEASE: ${{ inputs.version || github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          FFMPEG: ${{ matrix.ffmpeg }}
+          DEFAULT: ${{ matrix.default }}
+        run: |
+          ARGS=(--image "$IMAGE" --release "$RELEASE" --ffmpeg "$FFMPEG")
+          # NOT `[ … ] && ARGS+=(…)`: as a standalone command that returns 1 when false, and
+          # Actions runs `run:` steps with `bash -e` — the three non-default rows would have died here.
+          if [ "$DEFAULT" = "true" ]; then
+            ARGS+=(--default)
+          fi
+          TAGS=$(python3 docs/scripts/image-tags.py "${ARGS[@]}")
+          LABELS=$(python3 docs/scripts/image-tags.py --release "$RELEASE" --labels \
+                   --revision "$GITHUB_SHA")
+          {
+            echo "tags<<EOF"; echo "$TAGS"; echo "EOF"
+            echo "labels<<EOF"; echo "$LABELS"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          while IFS= read -r t; do echo "  $t"; done <<< "$TAGS"
 
-      # Solo per la variante di default: v1.2.3, v1.2, v1, latest (senza suffisso).
-      - name: Metadata (default, senza suffisso)
-        id: meta_default
-        if: matrix.default
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          flavor: latest=true
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-
-      # Build locale per poter testare PRIMA di pubblicare. La push successiva
-      # riusa la cache, quindi non ricompila.
-      - name: Build per test
+      # Local build so the image can be tested BEFORE publishing. The push below reuses the
+      # cache, so nothing is compiled twice.
+      - name: Build for testing
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -88,17 +103,17 @@ jobs:
           cache-from: type=gha,scope=ffmpeg-${{ matrix.ffmpeg }}
           cache-to: type=gha,scope=ffmpeg-${{ matrix.ffmpeg }},mode=max
 
-      - name: Smoke test (gate di pubblicazione)
+      - name: Smoke test (publication gate)
         run: ./tests/smoke.sh ffmpeg-nvenc:candidate ${{ matrix.ffmpeg }}
 
-      - name: Login su GitHub Container Registry
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build e push
+      - name: Build and push
         id: push
         uses: docker/build-push-action@v6
         with:
@@ -106,9 +121,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ steps.meta.outputs.tags }}
-            ${{ steps.meta_default.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FFMPEG_VERSION=${{ matrix.ffmpeg }}
@@ -117,13 +130,12 @@ jobs:
           provenance: true
           sbom: true
 
-      - name: Riepilogo
+      - name: Summary
         run: |
           {
             echo "### FFmpeg ${{ matrix.ffmpeg }} (nv-codec-headers ${{ matrix.nvcodec }})"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
-            echo "${{ steps.meta_default.outputs.tags }}"
             echo '```'
             echo "digest: \`${{ steps.push.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

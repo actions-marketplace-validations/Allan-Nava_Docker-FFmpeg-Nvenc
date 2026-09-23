@@ -1,0 +1,2 @@
+WARNING: buildx: failed to read current commit information with git rev-parse --is-inside-work-tree
+ERROR: listing workers for Build: failed to list workers: Canceled: context canceled
