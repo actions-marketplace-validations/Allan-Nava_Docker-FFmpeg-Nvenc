@@ -33,7 +33,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout (full history, tags included)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 

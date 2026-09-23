@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Tests
         run: python3 -m unittest discover -s tests -p 'test_backlog.py'
@@ -62,7 +62,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       # On push the run is informational (plan in the log); it applies from the schedule and from
       # a workflow_dispatch with apply=true.
